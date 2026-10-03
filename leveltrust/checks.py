@@ -6,6 +6,7 @@ Every finding carries an `innocent` explanation: a flag is a lead, not a verdict
 """
 import collections
 import os
+import struct
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,6 +25,19 @@ class Finding:
     title: str
     detail: str
     innocent: str = ""
+
+
+def _ntfs_times(extra: bytes):
+    """Decode the ZIP NTFS extra field (tag 0x000a) -> (mtime, atime, ctime) in UTC, or None."""
+    i = 0
+    while i + 4 <= len(extra):
+        tag, ln = struct.unpack("<HH", extra[i:i + 4])
+        d = extra[i + 4:i + 4 + ln]
+        i += 4 + ln
+        if tag == 0x000A and len(d) >= 32:
+            conv = lambda v: datetime(1601, 1, 1) + timedelta(microseconds=v // 10)
+            return tuple(conv(v) for v in struct.unpack("<QQQ", d[8:32]))
+    return None
 
 
 def _hm(td):
@@ -61,8 +75,20 @@ def container_checks(rec: Record, zip_path=None, entry=None):
         mtime = datetime(*zi.date_time)
         if zf.testzip() is not None:
             out.append(Finding(name, "L1", HIGH, "ZIP 内部 CRC 校验失败", "压缩包有损坏或被改写过。"))
-        if zi.extra:
-            out.append(Finding(name, "L1", INFO, "ZIP 条目带扩展字段", f"extra={zi.extra[:32].hex()},可含精确时间,可交叉印证。"))
+        ntfs = _ntfs_times(zi.extra)
+        if ntfs:
+            m, a, c = ntfs
+            f = lambda d: d.strftime("%H:%M:%S")
+            detail = f"(UTC) 创建 {f(c)} / 最后修改 {f(m)} / 最后访问 {f(a)}。"
+            if (m - c).total_seconds() > 60:
+                out.append(Finding(name, "L1", MED, "文件创建后又被修改保存过",
+                                   detail + f"修改比创建晚 {(m - c).total_seconds() / 60:.1f} 分钟,说明导出后被打开并保存过。",
+                                   "仪器软件导出后补充表头/工程名也会这样;需问清谁在什么时候做了什么。"))
+            elif abs((m - c).total_seconds()) < 1:
+                out.append(Finding(name, "L1", INFO, "创建与修改同一瞬间(一次性写入)",
+                                   detail + "典型于直接导出、复制或'另存为'生成的新文件;本身不能区分三者。"))
+            else:
+                out.append(Finding(name, "L1", INFO, "NTFS 时间", detail))
     elif os.path.exists(rec.path):
         mtime = datetime.fromtimestamp(os.stat(rec.path).st_mtime)
     if mtime and hdr:
